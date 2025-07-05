@@ -1,0 +1,1370 @@
+//+------------------------------------------------------------------+
+//| Enhanced Expert Advisor for XAUUSD (M30) v.5.1                 |
+//| Strategy: Multi-EMA + ATR + RSI + Multi-Timeframe + Structure   |
+//| Risk: 3% per trade | Max 1 SL & 3 TP per day                    |
+//| Enhanced: Multi-indicator + Volatility filtering + MTF          |
+//+------------------------------------------------------------------+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//+------------------------------------------------------------------+
+//| Trading Mode Enum                                                |
+//+------------------------------------------------------------------+
+enum ENUM_TRADING_MODE {
+    Conservative = 0,
+    Moderate = 1
+};
+
+enum ENUM_MODE_SWITCH_TRIGGER {
+    TRIGGER_VOLATILITY = 0,
+    TRIGGER_TREND_STRENGTH = 1,
+    TRIGGER_PERFORMANCE = 2,
+    TRIGGER_COMBINED = 3
+};
+
+string GetModeText(ENUM_TRADING_MODE mode)
+{
+    switch(mode)
+    {
+        case Conservative: return "CONSERVATIVE";
+        case Moderate:     return "MODERATE";
+        default:           return "UNKNOWN";
+    }
+}
+//+--------------------------+
+//| Input Parameters         |
+//+--------------------------+
+input ENUM_TRADING_MODE TradingMode = Conservative;  
+input int      SL_Points     = 700;      // Stop Loss in points
+input int      TP_Points     = 1400;     // Take Profit in points
+input double   RiskPercent   = 3.0;      // Risk percentage per trade
+input int      EMAPeriod     = 100;      // Main EMA period
+input int      FastEMA       = 20;       // Fast EMA for additional confirmation
+input int      SlowEMA       = 50;       // Slow EMA for trend confirmation
+input int      RSIPeriod     = 14;       // RSI period
+input int      ATRPeriod     = 14;       // ATR period for volatility
+input int      StartHour     = 0;        // Trading start hour
+input int      EndHour       = 23;       // Trading end hour
+input bool     UseTrailingSL = true;     // Use trailing stop loss
+input int      TrailStart    = 250;      // Trailing start points
+input int      TrailStep     = 50;      // Trailing step points
+input bool     UseBreakeven  = true;     // Use breakeven
+input int      BreakevenAfter= 800;      // Breakeven trigger points
+
+
+// Enhanced Multi-Timeframe Parameters
+input bool     UseMultiTimeframe = true;  // Use multi-timeframe analysis
+input ENUM_TIMEFRAMES HigherTF = PERIOD_H1; // Higher timeframe for trend confirmation
+input int      TrendAnalysisBars = 20;    // Bars for trend analysis
+input double   TrendStrengthThreshold = 0.65; // Trend strength threshold
+input int      StructureLookback = 12;    // Structure lookback period
+input double   TrendWeakeningThreshold = 0.45; // Trend weakening threshold
+input int      MinBarsForStructure = 4;   // Minimum bars for structure
+
+// Auto Mode Switching Parameters (Phase 1)
+input bool     EnableAutoModeSwitch = false;     // Enable automatic mode switching
+input ENUM_MODE_SWITCH_TRIGGER ModeSwitchTrigger = TRIGGER_COMBINED;
+input int      ModeEvaluationMinutes = 120;      // Minutes to evaluate before switching
+input double   VolatilityThresholdHigh = 80.0;   // High volatility threshold (ATR points)
+input double   VolatilityThresholdLow = 40.0;    // Low volatility threshold (ATR points)
+input double   TrendStrengthSwitchThreshold = 0.75; // Strong trend threshold for switching
+input double   PerformanceThreshold = -1.5;      // Performance threshold (% loss)
+input int      MinModeHoldMinutes = 60;         // Minimum minutes to hold a mode
+input bool     AllowSwitchDuringPositions = false; // Allow switching with open positions
+
+// Volatility and Risk Parameters
+input bool     UseATRFilter = true;       // Use ATR volatility filter
+input double   ATRMultiplier = 2.0;       // ATR multiplier for volatility
+input double   MaxATRLevel = 1000.0;        // Maximum ATR level (points)
+input double   MinATRLevel = 50.0;        // Minimum ATR level (points)
+input bool     UseVolatilityPosition = true; // Use volatility-based position sizing
+
+// RSI Parameters
+input bool     UseRSIFilter = true;       // Use RSI filter
+input double   RSIOverbought = 70.0;      // RSI overbought level
+input double   RSIOversold = 30.0;        // RSI oversold level
+input bool     UseRSIDivergence = true;   // Check for RSI divergence
+
+// Economic Calendar Parameters
+input bool     UseEconomicCalendar = true;
+input int      NewsWaitMinutes = 5;      // Wait minutes after news
+input bool     TradeOnHighImpact = false; // Trade during high impact news
+input bool     TradeOnMediumImpact = true; // Trade during medium impact news
+input string   NewsCurrencies = "USD,EUR"; // Currencies to monitor
+
+// Gap Protection
+input bool     UseGapProtection = true;   // Enable gap protection
+input double   MaxGapSize = 300.0;        // Maximum gap size in points
+
+//+--------------------------+
+//| Global Variables         |
+//+--------------------------+
+int emaHandle, fastEMAHandle, slowEMAHandle, rsiHandle, atrHandle;
+int higherTFEMAHandle; // Higher timeframe EMA
+double emaBuffer[], fastEMABuffer[], slowEMABuffer[], rsiBuffer[], atrBuffer[];
+double higherTFEMABuffer[];
+bool basicSLHitToday = false;
+int tpHitCountToday = 0;
+datetime lastTradingDay = 0;
+datetime lastTradeTime = 0;
+double lastClosePrice = 0;
+
+// Auto Mode Switching Variables (Phase 1)
+ENUM_TRADING_MODE currentActiveMode;
+ENUM_TRADING_MODE lastActiveMode;
+datetime lastModeSwitch = 0;
+datetime modeEvaluationStart = 0;
+int modePerformanceCount = 0;
+double modeStartBalance = 0;
+bool modeSwitchEnabled = false;
+struct ModePerformance {
+    int conservativeWins;
+    int conservativeLosses;
+    double conservativeProfit;
+    int moderateWins;
+    int moderateLosses;
+    double moderateProfit;
+    datetime lastReset;
+};
+ModePerformance modeStats;
+
+// Economic Calendar Variables
+struct NewsEvent {
+    datetime time;
+    string currency;
+    int importance;
+    string name;
+    bool processed;
+};
+NewsEvent recentNews[];
+datetime lastNewsCheck = 0;
+bool newsBlockActive = false;
+datetime newsBlockUntil = 0;
+
+// Market structure variables
+struct MarketStructure {
+    double lastHigh;
+    double lastLow;
+    int lastHighBar;
+    int lastLowBar;
+    bool isUptrend;
+    bool isDowntrend;
+    bool isBroken;
+    double keyLevel;
+    double supportLevel;
+    double resistanceLevel;
+};
+MarketStructure structure;
+
+// Enhanced trend analysis variables
+struct TrendAnalysis {
+    int direction;
+    double strength;
+    bool isStrong;
+    bool isWeakening;
+    bool higherTFConfirmed;
+    datetime lastUpdate;
+    double emaSlope;
+    bool crossoverSignal;
+};
+TrendAnalysis currentTrend;
+
+// Volatility analysis
+struct VolatilityData {
+    double currentATR;
+    double averageATR;
+    bool isHighVolatility;
+    bool isLowVolatility;
+    double volatilityMultiplier;
+};
+VolatilityData volatility;
+
+// RSI analysis
+struct RSIData {
+    double currentRSI;
+    bool isOverbought;
+    bool isOversold;
+    bool bullishDivergence;
+    bool bearishDivergence;
+};
+RSIData rsiData;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit() {
+    // Create indicator handles
+    emaHandle = iMA(_Symbol, PERIOD_M30, EMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+    fastEMAHandle = iMA(_Symbol, PERIOD_M30, FastEMA, 0, MODE_EMA, PRICE_CLOSE);
+    slowEMAHandle = iMA(_Symbol, PERIOD_M30, SlowEMA, 0, MODE_EMA, PRICE_CLOSE);
+    rsiHandle = iRSI(_Symbol, PERIOD_M30, RSIPeriod, PRICE_CLOSE);
+    atrHandle = iATR(_Symbol, PERIOD_M30, ATRPeriod);
+    // Initialize mode switching system
+InitializeModeSwitch();
+Print("🔁 Starting in Trading Mode: ", GetModeText(currentActiveMode));
+
+    // Higher timeframe EMA
+    if (UseMultiTimeframe) {
+        higherTFEMAHandle = iMA(_Symbol, HigherTF, EMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+        if (higherTFEMAHandle == INVALID_HANDLE) {
+            Print("Failed to create higher timeframe EMA handle");
+            return INIT_FAILED;
+        }
+    }
+    
+    // Check handles
+    if (emaHandle == INVALID_HANDLE || fastEMAHandle == INVALID_HANDLE || 
+        slowEMAHandle == INVALID_HANDLE || rsiHandle == INVALID_HANDLE || 
+        atrHandle == INVALID_HANDLE) {
+        Print("Failed to create indicator handles");
+        return INIT_FAILED;
+    }
+    
+    // Set arrays as series
+    ArraySetAsSeries(emaBuffer, true);
+    ArraySetAsSeries(fastEMABuffer, true);
+    ArraySetAsSeries(slowEMABuffer, true);
+    ArraySetAsSeries(rsiBuffer, true);
+    ArraySetAsSeries(atrBuffer, true);
+    ArraySetAsSeries(higherTFEMABuffer, true);
+    
+    // Initialize structures
+    InitializeMarketStructure();
+    InitializeTrendAnalysis();
+    InitializeVolatilityData();
+    InitializeRSIData();
+    InitializeNewsArray();
+    
+    ResetDailyFlags();
+    
+    Print("Enhanced EA v.5.1 initialized successfully");
+    Print("Multi-timeframe: ", UseMultiTimeframe ? "Enabled" : "Disabled");
+    Print("ATR Filter: ", UseATRFilter ? "Enabled" : "Disabled");
+    Print("RSI Filter: ", UseRSIFilter ? "Enabled" : "Disabled");
+    Print("Gap Protection: ", UseGapProtection ? "Enabled" : "Disabled");
+    
+    return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) {
+    if (emaHandle != INVALID_HANDLE) IndicatorRelease(emaHandle);
+    if (fastEMAHandle != INVALID_HANDLE) IndicatorRelease(fastEMAHandle);
+    if (slowEMAHandle != INVALID_HANDLE) IndicatorRelease(slowEMAHandle);
+    if (rsiHandle != INVALID_HANDLE) IndicatorRelease(rsiHandle);
+    if (atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
+    if (higherTFEMAHandle != INVALID_HANDLE) IndicatorRelease(higherTFEMAHandle);
+}
+
+//+------------------------------------------------------------------+
+//| Initialize structures                                             |
+//+------------------------------------------------------------------+
+void InitializeNewsArray() {
+    ArrayResize(recentNews, 0);
+    lastNewsCheck = 0;
+    newsBlockActive = false;
+    newsBlockUntil = 0;
+}
+
+void InitializeMarketStructure() {
+    structure.lastHigh = 0;
+    structure.lastLow = 0;
+    structure.lastHighBar = 0;
+    structure.lastLowBar = 0;
+    structure.isUptrend = false;
+    structure.isDowntrend = false;
+    structure.isBroken = false;
+    structure.keyLevel = 0;
+    structure.supportLevel = 0;
+    structure.resistanceLevel = 0;
+}
+
+void InitializeTrendAnalysis() {
+    currentTrend.direction = 0;
+    currentTrend.strength = 0.5;
+    currentTrend.isStrong = false;
+    currentTrend.isWeakening = false;
+    currentTrend.higherTFConfirmed = false;
+    currentTrend.lastUpdate = 0;
+    currentTrend.emaSlope = 0;
+    currentTrend.crossoverSignal = false;
+}
+
+void InitializeVolatilityData() {
+    volatility.currentATR = 0;
+    volatility.averageATR = 0;
+    volatility.isHighVolatility = false;
+    volatility.isLowVolatility = false;
+    volatility.volatilityMultiplier = 1.0;
+}
+
+void InitializeRSIData() {
+    rsiData.currentRSI = 50;
+    rsiData.isOverbought = false;
+    rsiData.isOversold = false;
+    rsiData.bullishDivergence = false;
+    rsiData.bearishDivergence = false;
+}
+
+//+------------------------------------------------------------------+
+//| Reset daily flags                                                |
+//+------------------------------------------------------------------+
+void ResetDailyFlags() {
+    MqlDateTime dt;
+    TimeToStruct(TimeCurrent(), dt);
+    datetime currentDay = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
+    
+    if (currentDay != lastTradingDay) {
+        basicSLHitToday = false;
+        tpHitCountToday = 0;
+        InitializeMarketStructure();
+        InitializeTrendAnalysis();
+        InitializeVolatilityData();
+        InitializeRSIData();
+        InitializeNewsArray();
+        lastTradingDay = currentDay;
+        Print("New trading day started. All counters reset.");
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check gap protection                                              |
+//+------------------------------------------------------------------+
+bool CheckGapProtection() {
+    if (!UseGapProtection) return true;
+    
+    double currentPrice = iClose(_Symbol, PERIOD_M30, 0);
+    
+    if (lastClosePrice > 0) {
+        double gap = MathAbs(currentPrice - lastClosePrice);
+        double gapPoints = gap / _Point;
+        
+        if (gapPoints > MaxGapSize) {
+            Print("Large gap detected: ", gapPoints, " points. Waiting for stabilization.");
+            return false;
+        }
+    }
+    
+    lastClosePrice = currentPrice;
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Enhanced volatility analysis                                     |
+//+------------------------------------------------------------------+
+bool AnalyzeVolatility() {
+    if (!UseATRFilter) return true;
+
+    if (CopyBuffer(atrHandle, 0, 0, 10, atrBuffer) <= 0) {
+        Print("❌ Failed to copy ATR buffer");
+        return false;
+    }
+
+    if (atrBuffer[0] <= 0.0) {
+        Print("⚠️ ATR buffer returned 0.0 — EA waiting for valid data...");
+        return false;
+    }
+
+    volatility.currentATR = atrBuffer[0] / _Point;
+
+    // Calculate average ATR
+    double sum = 0;
+    for (int i = 0; i < 10; i++) {
+        sum += atrBuffer[i];
+    }
+    volatility.averageATR = (sum / 10) / _Point;
+
+    volatility.isHighVolatility = volatility.currentATR > MaxATRLevel;
+    volatility.isLowVolatility = volatility.currentATR < MinATRLevel;
+
+    if (UseVolatilityPosition) {
+        volatility.volatilityMultiplier = volatility.averageATR / volatility.currentATR;
+        volatility.volatilityMultiplier = MathMax(0.5, MathMin(2.0, volatility.volatilityMultiplier));
+    } else {
+        volatility.volatilityMultiplier = 1.0;
+    }
+
+    if (volatility.isHighVolatility) {
+        Print("🚫 High volatility detected: ", volatility.currentATR, " points. No trade.");
+        return false;
+    }
+
+    if (volatility.isLowVolatility) {
+        Print("🔕 Low volatility detected: ", volatility.currentATR, " points. No trade.");
+        return false;
+    }
+
+    return true;
+}
+
+
+//+------------------------------------------------------------------+
+//| Enhanced RSI analysis                                            |
+//+------------------------------------------------------------------+
+bool AnalyzeRSI() {
+    if (!UseRSIFilter) return true;
+    
+    if (CopyBuffer(rsiHandle, 0, 0, 5, rsiBuffer) <= 0) {
+        Print("Failed to copy RSI buffer");
+        return false;
+    }
+    
+    rsiData.currentRSI = rsiBuffer[0];
+    rsiData.isOverbought = rsiData.currentRSI > RSIOverbought;
+    rsiData.isOversold = rsiData.currentRSI < RSIOversold;
+    
+    // Check for RSI divergence
+    if (UseRSIDivergence) {
+        CheckRSIDivergence();
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check RSI divergence                                             |
+//+------------------------------------------------------------------+
+void CheckRSIDivergence() {
+    if (ArraySize(rsiBuffer) < 5) return;
+    
+    double currentPrice = iClose(_Symbol, PERIOD_M30, 0);
+    double previousPrice = iClose(_Symbol, PERIOD_M30, 4);
+    
+    // Bullish divergence: price makes lower low, RSI makes higher low
+    if (currentPrice < previousPrice && rsiBuffer[0] > rsiBuffer[4]) {
+        rsiData.bullishDivergence = true;
+        rsiData.bearishDivergence = false;
+    }
+    // Bearish divergence: price makes higher high, RSI makes lower high
+    else if (currentPrice > previousPrice && rsiBuffer[0] < rsiBuffer[4]) {
+        rsiData.bearishDivergence = true;
+        rsiData.bullishDivergence = false;
+    }
+    else {
+        rsiData.bullishDivergence = false;
+        rsiData.bearishDivergence = false;
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Enhanced multi-timeframe trend analysis                          |
+//+------------------------------------------------------------------+
+bool AnalyzeTrendRealTime() {
+    // Copy all indicator buffers
+    if (CopyBuffer(emaHandle, 0, 0, TrendAnalysisBars, emaBuffer) <= 0) return false;
+    if (CopyBuffer(fastEMAHandle, 0, 0, TrendAnalysisBars, fastEMABuffer) <= 0) return false;
+    if (CopyBuffer(slowEMAHandle, 0, 0, TrendAnalysisBars, slowEMABuffer) <= 0) return false;
+    
+    // Higher timeframe analysis
+    if (UseMultiTimeframe) {
+        if (CopyBuffer(higherTFEMAHandle, 0, 0, 5, higherTFEMABuffer) <= 0) return false;
+        
+        double higherTFPrice = iClose(_Symbol, HigherTF, 0);
+        double higherTFEMA = higherTFEMABuffer[0];
+        
+        currentTrend.higherTFConfirmed = (higherTFPrice > higherTFEMA);
+    }
+    
+    // Calculate EMA slope
+    if (ArraySize(emaBuffer) >= 3) {
+        currentTrend.emaSlope = (emaBuffer[0] - emaBuffer[2]) / (2 * _Point);
+    }
+    
+    // Check for EMA crossover
+    if (ArraySize(fastEMABuffer) >= 2 && ArraySize(slowEMABuffer) >= 2) {
+        bool currentCross = fastEMABuffer[0] > slowEMABuffer[0];
+        bool previousCross = fastEMABuffer[1] > slowEMABuffer[1];
+        currentTrend.crossoverSignal = (currentCross != previousCross);
+    }
+    
+    // Enhanced trend strength calculation
+    int bullishCount = 0;
+    int bearishCount = 0;
+    
+    for (int i = 1; i < TrendAnalysisBars; i++) {
+        double price = iClose(_Symbol, PERIOD_M30, i);
+        double ema = emaBuffer[i];
+        double fastEMA = fastEMABuffer[i];
+        double slowEMA = slowEMABuffer[i];
+        
+        // Weight based on multiple factors
+        int weight = (i <= 6) ? 3 : (i <= 12) ? 2 : 1;
+        
+        // Multi-EMA confirmation
+        if (price > ema && fastEMA > slowEMA) {
+            bullishCount += weight;
+        } else if (price < ema && fastEMA < slowEMA) {
+            bearishCount += weight;
+        }
+    }
+    
+    // Calculate trend strength
+    int totalWeight = bullishCount + bearishCount;
+    if (totalWeight == 0) return false;
+    
+    double bullishPercentage = (double)bullishCount / totalWeight;
+    double bearishPercentage = (double)bearishCount / totalWeight;
+    
+    currentTrend.strength = MathMax(bullishPercentage, bearishPercentage);
+    currentTrend.lastUpdate = TimeCurrent();
+    
+    // Determine trend direction and strength
+    if (bullishPercentage >= TrendStrengthThreshold) {
+        currentTrend.direction = 1;
+        currentTrend.isStrong = true;
+        currentTrend.isWeakening = false;
+    } else if (bearishPercentage >= TrendStrengthThreshold) {
+        currentTrend.direction = -1;
+        currentTrend.isStrong = true;
+        currentTrend.isWeakening = false;
+    } else if (currentTrend.strength < TrendWeakeningThreshold) {
+        currentTrend.isWeakening = true;
+        currentTrend.isStrong = false;
+    } else {
+        currentTrend.direction = 0;
+        currentTrend.isStrong = false;
+        currentTrend.isWeakening = false;
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Enhanced market structure analysis                               |
+//+------------------------------------------------------------------+
+bool AnalyzeMarketStructure() {
+    double highestHigh = 0;
+    double lowestLow = 999999;
+    int highBar = 0;
+    int lowBar = 0;
+    
+    // Find recent highs and lows
+    for (int i = 1; i <= StructureLookback; i++) {
+        double high = iHigh(_Symbol, PERIOD_M30, i);
+        double low = iLow(_Symbol, PERIOD_M30, i);
+        
+        if (high > highestHigh) {
+            highestHigh = high;
+            highBar = i;
+        }
+        
+        if (low < lowestLow) {
+            lowestLow = low;
+            lowBar = i;
+        }
+    }
+    
+    // Update support and resistance levels
+    structure.resistanceLevel = highestHigh;
+    structure.supportLevel = lowestLow;
+    
+    // Check for new higher high
+    if (highestHigh > structure.lastHigh && highBar < MinBarsForStructure) {
+        structure.lastHigh = highestHigh;
+        structure.lastHighBar = highBar;
+        structure.isUptrend = true;
+        structure.isDowntrend = false;
+        structure.keyLevel = structure.lastLow;
+        structure.isBroken = false;
+        Print("Structure: NEW HIGHER HIGH - UPTREND confirmed");
+    }
+    
+    // Check for new lower low
+    if (lowestLow < structure.lastLow && lowBar < MinBarsForStructure) {
+        structure.lastLow = lowestLow;
+        structure.lastLowBar = lowBar;
+        structure.isDowntrend = true;
+        structure.isUptrend = false;
+        structure.keyLevel = structure.lastHigh;
+        structure.isBroken = false;
+        Print("Structure: NEW LOWER LOW - DOWNTREND confirmed");
+    }
+    
+    // Check for structure break
+    double currentPrice = iClose(_Symbol, PERIOD_M30, 0);
+    
+    if (structure.isUptrend && currentPrice < structure.keyLevel) {
+        structure.isBroken = true;
+        structure.isUptrend = false;
+        Print("Structure: UPTREND BROKEN");
+    } else if (structure.isDowntrend && currentPrice > structure.keyLevel) {
+        structure.isBroken = true;
+        structure.isDowntrend = false;
+        Print("Structure: DOWNTREND BROKEN");
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Economic calendar check                                          |
+//+------------------------------------------------------------------+
+bool CheckEconomicCalendar() {
+    if (!UseEconomicCalendar) return true;
+    
+    // Check calendar every 5 minutes
+    if (TimeCurrent() - lastNewsCheck < 300) {
+        return !newsBlockActive || TimeCurrent() > newsBlockUntil;
+    }
+    
+    lastNewsCheck = TimeCurrent();
+    
+    // Get calendar events
+    datetime from = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
+    datetime to = from + 86400 * 2;
+    
+    MqlCalendarValue calendarValues[];
+    
+    if (CalendarValueHistory(calendarValues, from, to)) {
+        for (int i = 0; i < ArraySize(calendarValues); i++) {
+            MqlCalendarEvent event;
+            MqlCalendarCountry country;
+            
+            if (CalendarEventById(calendarValues[i].event_id, event) &&
+                CalendarCountryById(event.country_id, country)) {
+                
+                if (!IsCurrencyMonitored(country.currency)) continue;
+                
+                int importance = (int)event.importance;
+                const int HIGH_IMPORTANCE = 3;
+                const int MEDIUM_IMPORTANCE = 2;
+                
+                if (importance >= MEDIUM_IMPORTANCE) {
+                    datetime eventTime = calendarValues[i].time;
+                    datetime currentTime = TimeCurrent();
+                    
+                    if (eventTime >= currentTime - 3600 && eventTime <= currentTime + 7200) {
+                        if (importance >= HIGH_IMPORTANCE && !TradeOnHighImpact) {
+                            newsBlockActive = true;
+                            newsBlockUntil = eventTime + NewsWaitMinutes * 60;
+                            Print("HIGH IMPACT NEWS: Trading blocked until ", TimeToString(newsBlockUntil));
+                            return false;
+                        }
+                        
+                        if (importance == MEDIUM_IMPORTANCE && TradeOnMediumImpact) {
+                            if (currentTime < eventTime + NewsWaitMinutes * 60 && 
+                                currentTime >= eventTime - 1800) {
+                                newsBlockActive = true;
+                                newsBlockUntil = eventTime + NewsWaitMinutes * 60;
+                                Print("MEDIUM IMPACT NEWS: Waiting until ", TimeToString(newsBlockUntil));
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    if (newsBlockActive && TimeCurrent() > newsBlockUntil) {
+        newsBlockActive = false;
+        Print("News wait period ended. Trading resumed.");
+    }
+    
+    return !newsBlockActive;
+}
+
+//+------------------------------------------------------------------+
+//| Check if currency is monitored                                   |
+//+------------------------------------------------------------------+
+bool IsCurrencyMonitored(string currency) {
+    string currencies[];
+    int count = StringSplit(NewsCurrencies, ',', currencies);
+    
+    for (int i = 0; i < count; i++) {
+        StringTrimLeft(currencies[i]);
+        StringTrimRight(currencies[i]);
+        if (currencies[i] == currency) {
+            return true;
+        }
+    }
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check trading session                                            |
+//+------------------------------------------------------------------+
+bool InSession() {
+    MqlDateTime dt;
+    TimeToStruct(TimeCurrent(), dt);
+    return (dt.hour >= StartHour && dt.hour <= EndHour);
+}
+
+//+------------------------------------------------------------------+
+//| Enhanced lot size calculation with volatility adjustment         |
+//+------------------------------------------------------------------+
+double CalculateLotSize(int stopLossPoints) {
+    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double pointValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE) / 
+                       SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE) * 
+                       SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    
+    double riskAmount = balance * RiskPercent / 100.0;
+    double lot = riskAmount / (stopLossPoints * pointValue);
+    
+    // Apply volatility adjustment
+    lot *= volatility.volatilityMultiplier;
+    
+    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    
+    lot = MathMax(minLot, MathMin(maxLot, lot));
+    lot = NormalizeDouble(lot / lotStep, 0) * lotStep;
+    
+    return lot;
+}
+
+//+------------------------------------------------------------------+
+//| Enhanced entry conditions                                        |
+//+------------------------------------------------------------------+
+bool EntryCondition(bool isBuy) {
+    // 1. Economic calendar check
+    if (!CheckEconomicCalendar()) return false;
+
+    // 2. Gap protection
+    if (!CheckGapProtection()) return false;
+
+    // 3. Volatility filter
+    if (!AnalyzeVolatility()) return false;
+
+    // 4. Trend strength
+    if (!currentTrend.isStrong) return false;
+
+    // 5. Trend direction alignment
+    if (isBuy && currentTrend.direction != 1) return false;
+    if (!isBuy && currentTrend.direction != -1) return false;
+
+    // 6. Higher timeframe confirmation
+    if (UseMultiTimeframe) {
+        if (isBuy && !currentTrend.higherTFConfirmed) return false;
+        if (!isBuy && currentTrend.higherTFConfirmed) return false;
+    }
+
+    // 7. Market structure alignment — SKIP in Moderate Mode
+    if (TradingMode == Conservative) {
+        if (isBuy && !structure.isUptrend) return false;
+        if (!isBuy && !structure.isDowntrend) return false;
+    }
+
+    // 8. Multi-EMA confirmation
+    double emaCurrent = emaBuffer[0];
+    double fastEMACurrent = fastEMABuffer[0];
+    double slowEMACurrent = slowEMABuffer[0];
+    double priceCurrent = iClose(_Symbol, PERIOD_M30, 0);
+
+    if (isBuy) {
+        if (!(priceCurrent > emaCurrent && fastEMACurrent > slowEMACurrent)) return false;
+    } else {
+        if (!(priceCurrent < emaCurrent && fastEMACurrent < slowEMACurrent)) return false;
+    }
+
+    // 9. RSI confirmation — SKIP divergence in Moderate Mode
+    if (UseRSIFilter) {
+        if (isBuy && rsiData.isOverbought) return false;
+        if (!isBuy && rsiData.isOversold) return false;
+
+        if (UseRSIDivergence && TradingMode == Conservative) {
+            if (isBuy && !rsiData.bullishDivergence && rsiData.bearishDivergence) return false;
+            if (!isBuy && !rsiData.bearishDivergence && rsiData.bullishDivergence) return false;
+        }
+    }
+
+    // 10. EMA slope — SKIP in Moderate Mode
+    if (TradingMode == Conservative) {
+        if (isBuy && currentTrend.emaSlope < 0) return false;
+        if (!isBuy && currentTrend.emaSlope > 0) return false;
+    }
+
+    // 11. Momentum confirmation (keep for both modes)
+    double priceChange = iClose(_Symbol, PERIOD_M30, 0) - iClose(_Symbol, PERIOD_M30, 1);
+    bool momentumAlignment = (isBuy ? priceChange > 0 : priceChange < 0);
+
+    return momentumAlignment;
+}
+
+
+//+------------------------------------------------------------------+
+//| Enhanced exit conditions                                         |
+//+------------------------------------------------------------------+
+bool ShouldExitDueToTrendWeakening() {
+    if (currentTrend.isWeakening) {
+        Print("TREND WEAKENING! Strength: ", DoubleToString(currentTrend.strength * 100, 1), "%");
+        return true;
+    }
+    
+    if (structure.isBroken) {
+        Print("STRUCTURE BROKEN! Exiting positions.");
+        return true;
+    }
+return false;
+}
+
+//+------------------------------------------------------------------+
+//| Close all positions                                              |
+//+------------------------------------------------------------------+
+void CloseAllPositions() {
+    for (int i = PositionsTotal() - 1; i >= 0; i--) {
+        if (PositionGetSymbol(i) == _Symbol) {
+            ulong ticket = PositionGetTicket(i);
+            if (ticket > 0) {
+                trade.PositionClose(ticket);
+                Print("Position closed due to exit condition: ", ticket);
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check and manage existing positions                              |
+//+------------------------------------------------------------------+
+void ManagePositions() {
+    for (int i = PositionsTotal() - 1; i >= 0; i--) {
+        if (PositionGetSymbol(i) == _Symbol) {
+            ulong ticket = PositionGetTicket(i);
+            if (ticket > 0) {
+                double positionProfit = PositionGetDouble(POSITION_PROFIT);
+                double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+                double currentPrice = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 
+                                    SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
+                                    SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+                
+                ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+                
+                // Check for breakeven
+                if (UseBreakeven) {
+                    double pointsProfit = (posType == POSITION_TYPE_BUY) ? 
+                                        (currentPrice - openPrice) / _Point : 
+                                        (openPrice - currentPrice) / _Point;
+                    
+                    if (pointsProfit >= BreakevenAfter) {
+                        double currentSL = PositionGetDouble(POSITION_SL);
+                        double newSL = openPrice;
+                        
+                        bool needUpdate = false;
+                        if (posType == POSITION_TYPE_BUY && (currentSL == 0 || currentSL < newSL)) {
+                            needUpdate = true;
+                        } else if (posType == POSITION_TYPE_SELL && (currentSL == 0 || currentSL > newSL)) {
+                            needUpdate = true;
+                        }
+                        
+                        if (needUpdate) {
+                            double tp = PositionGetDouble(POSITION_TP);
+                            if (trade.PositionModify(ticket, newSL, tp)) {
+                                Print("Breakeven applied for position: ", ticket);
+                            }
+                        }
+                    }
+                }
+                
+                // Check for trailing stop
+                if (UseTrailingSL) {
+                    double pointsProfit = (posType == POSITION_TYPE_BUY) ? 
+                                        (currentPrice - openPrice) / _Point : 
+                                        (openPrice - currentPrice) / _Point;
+                    
+                    if (pointsProfit >= TrailStart) {
+                        double currentSL = PositionGetDouble(POSITION_SL);
+                        double newSL = 0;
+                        
+                        if (posType == POSITION_TYPE_BUY) {
+                            newSL = currentPrice - TrailStep * _Point;
+                            if (currentSL == 0 || newSL > currentSL) {
+                                double tp = PositionGetDouble(POSITION_TP);
+                                if (trade.PositionModify(ticket, newSL, tp)) {
+                                    Print("Trailing stop updated for BUY position: ", ticket, " New SL: ", newSL);
+                                }
+                            }
+                        } else {
+                            newSL = currentPrice + TrailStep * _Point;
+                            if (currentSL == 0 || newSL < currentSL) {
+                                double tp = PositionGetDouble(POSITION_TP);
+                                if (trade.PositionModify(ticket, newSL, tp)) {
+                                    Print("Trailing stop updated for SELL position: ", ticket, " New SL: ", newSL);
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Check for trend-based exit
+                if (ShouldExitDueToTrendWeakening()) {
+                    if (trade.PositionClose(ticket)) {
+                        Print("Position closed due to trend weakening: ", ticket);
+                    }
+                }
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check if we can open new positions                               |
+//+------------------------------------------------------------------+
+bool CanOpenNewPosition() {
+    // Check daily limits
+    if (basicSLHitToday) {
+        Print("Daily SL limit reached. No new positions allowed today.");
+        return false;
+    }
+    
+    if (tpHitCountToday >= 3) {
+        Print("Daily TP limit reached (3). No new positions allowed today.");
+        return false;
+    }
+    
+    // Check if we already have a position
+    for (int i = 0; i < PositionsTotal(); i++) {
+        if (PositionGetSymbol(i) == _Symbol) {
+            return false;
+        }
+    }
+    
+    // Check minimum time between trades (prevent overtrading)
+    if (TimeCurrent() - lastTradeTime < 3600) { // 1 hour minimum
+        return false;
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Open buy position                                                |
+//+------------------------------------------------------------------+
+void OpenBuy() {
+    if (!CanOpenNewPosition()) return;
+    
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double sl = ask - SL_Points * _Point;
+    double tp = ask + TP_Points * _Point;
+    
+    double lot = CalculateLotSize(SL_Points);
+    
+    if (trade.Buy(lot, _Symbol, ask, sl, tp, "Enhanced EA v5.1 - BUY")) {
+        Print("BUY order opened: Lot=", lot, " Ask=", ask, " SL=", sl, " TP=", tp);
+        lastTradeTime = TimeCurrent();
+    } else {
+        Print("Failed to open BUY order. Error: ", trade.ResultRetcode());
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Open sell position                                               |
+//+------------------------------------------------------------------+
+void OpenSell() {
+    if (!CanOpenNewPosition()) return;
+    
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double sl = bid + SL_Points * _Point;
+    double tp = bid - TP_Points * _Point;
+    
+    double lot = CalculateLotSize(SL_Points);
+    
+    if (trade.Sell(lot, _Symbol, bid, sl, tp, "Enhanced EA v5.1 - SELL")) {
+        Print("SELL order opened: Lot=", lot, " Bid=", bid, " SL=", sl, " TP=", tp);
+        lastTradeTime = TimeCurrent();
+    } else {
+        Print("Failed to open SELL order. Error: ", trade.ResultRetcode());
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Monitor closed positions for daily limits                        |
+//+------------------------------------------------------------------+
+void MonitorClosedPositions() {
+    datetime today = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
+    
+    HistorySelect(today, TimeCurrent());
+    
+    for (int i = 0; i < HistoryDealsTotal(); i++) {
+        ulong ticket = HistoryDealGetTicket(i);
+        if (ticket > 0) {
+            if (HistoryDealGetString(ticket, DEAL_SYMBOL) == _Symbol) {
+                if (HistoryDealGetInteger(ticket, DEAL_ENTRY) == DEAL_ENTRY_OUT) {
+                    double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+                    
+                    if (profit < 0) {
+                        basicSLHitToday = true;
+                        Print("Stop Loss hit today. No more trades allowed.");
+                        return;
+                    } else if (profit > 0) {
+                        // Count profitable trades (approximate TP hits)
+                        static int lastTPCount = 0;
+                        int currentTPCount = 0;
+                        
+                        for (int j = 0; j < HistoryDealsTotal(); j++) {
+                            ulong tpTicket = HistoryDealGetTicket(j);
+                            if (tpTicket > 0 && HistoryDealGetString(tpTicket, DEAL_SYMBOL) == _Symbol) {
+                                if (HistoryDealGetDouble(tpTicket, DEAL_PROFIT) > 0 && 
+                                    HistoryDealGetInteger(tpTicket, DEAL_ENTRY) == DEAL_ENTRY_OUT) {
+                                    currentTPCount++;
+                                }
+                            }
+                        }
+                        
+                        tpHitCountToday = currentTPCount;
+                        
+                        if (tpHitCountToday >= 3) {
+                            Print("Take Profit limit reached (3). No more trades allowed today.");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Print trading status                                             |
+//+------------------------------------------------------------------+
+void PrintTradingStatus() {
+    static datetime lastStatusTime = 0;
+
+    // Print status every 30 minutes
+    if (TimeCurrent() - lastStatusTime < 1800) return;
+
+    lastStatusTime = TimeCurrent();
+
+    Print("=== TRADING STATUS ===");
+    Print("Trend Direction: ", (currentTrend.direction == 1) ? "BULLISH" : 
+                             (currentTrend.direction == -1) ? "BEARISH" : "NEUTRAL");
+    Print("Trend Strength: ", DoubleToString(currentTrend.strength * 100, 1), "%");
+    Print("Structure: ", structure.isUptrend ? "UPTREND" : 
+                         structure.isDowntrend ? "DOWNTREND" : "NEUTRAL");
+    Print("Volatility (ATR): ", DoubleToString(volatility.currentATR, 1), " points");
+    Print("RSI: ", DoubleToString(rsiData.currentRSI, 1));
+    Print("Daily SL Hit: ", basicSLHitToday ? "YES" : "NO");
+    Print("Daily TP Count: ", tpHitCountToday, "/3");
+    Print("News Block Active: ", newsBlockActive ? "YES" : "NO");
+    Print("Active Positions: ", PositionsTotal());
+
+    if (modeSwitchEnabled) {
+        string activeModeText = (currentActiveMode == Conservative) ? "CONSERVATIVE" : "MODERATE";
+        Print("Active Mode: ", activeModeText);
+        Print("Auto-Switch: ", modeSwitchEnabled ? "ENABLED" : "DISABLED");
+        Print("Last Switch: ", TimeToString(lastModeSwitch));
+    }
+    Comment("Mode: ", GetModeText(currentActiveMode),
+            "\nTrend: ", (currentTrend.direction == 1 ? "BULLISH" : currentTrend.direction == -1 ? "BEARISH" : "NEUTRAL"),
+            "\nTrend Strength: ", DoubleToString(currentTrend.strength * 100, 1), "%",
+            "\nStructure: ", structure.isUptrend ? "UPTREND" : structure.isDowntrend ? "DOWNTREND" : "NEUTRAL",
+            "\nATR: ", DoubleToString(volatility.currentATR, 1), 
+            "\nRSI: ", DoubleToString(rsiData.currentRSI, 1),
+            "\nTP Hit Today: ", tpHitCountToday, "/3",
+            " | SL Hit: ", basicSLHitToday ? "YES" : "NO",
+            "\nNews Block: ", newsBlockActive ? "YES" : "NO");
+
+    Print("=====================");
+}
+
+
+//+------------------------------------------------------------------+
+//| Initialize Mode Switching System                                  |
+//+------------------------------------------------------------------+
+void InitializeModeSwitch() {
+    currentActiveMode = TradingMode;
+    lastActiveMode = TradingMode;
+    modeSwitchEnabled = EnableAutoModeSwitch;
+    modeEvaluationStart = TimeCurrent();
+    modeStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    
+    // Initialize mode performance tracking
+    modeStats.conservativeWins = 0;
+    modeStats.conservativeLosses = 0;
+    modeStats.conservativeProfit = 0;
+    modeStats.moderateWins = 0;
+    modeStats.moderateLosses = 0;
+    modeStats.moderateProfit = 0;
+    modeStats.lastReset = TimeCurrent();
+}
+
+//+------------------------------------------------------------------+
+//| Check if mode switch should occur                                |
+//+------------------------------------------------------------------+
+bool ShouldSwitchMode() {
+    if (!modeSwitchEnabled) return false;
+    if (TimeCurrent() - lastModeSwitch < MinModeHoldMinutes * 60) return false;
+    if (!AllowSwitchDuringPositions && PositionsTotal() > 0) return false;
+    if (PositionsTotal() == 0) {
+    ENUM_TRADING_MODE suggestedMode = EvaluateOptimalMode();
+    if (suggestedMode != currentActiveMode && suggestedMode != TradingMode) {
+        string reason = "";
+
+        switch (ModeSwitchTrigger) {
+            case TRIGGER_VOLATILITY:
+                reason = "Reason: Volatility thresholds triggered.";
+                break;
+            case TRIGGER_TREND_STRENGTH:
+                reason = "Reason: Strong or weak trend detected.";
+                break;
+            case TRIGGER_PERFORMANCE:
+                reason = "Reason: Performance below threshold.";
+                break;
+            case TRIGGER_COMBINED:
+                reason = "Reason: Combined scoring suggests change.";
+                break;
+        }
+
+        Print("📣 Mode switch check passed. ", reason);
+    }
+}
+
+    
+    ENUM_TRADING_MODE suggestedMode = EvaluateOptimalMode();
+    
+    return (suggestedMode != currentActiveMode && suggestedMode != TradingMode);
+}
+
+//+------------------------------------------------------------------+
+//| Evaluate optimal trading mode                                    |
+//+------------------------------------------------------------------+
+ENUM_TRADING_MODE EvaluateOptimalMode() {
+    switch(ModeSwitchTrigger) {
+        case TRIGGER_VOLATILITY:
+            return EvaluateByVolatility();
+        case TRIGGER_TREND_STRENGTH:
+            return EvaluateByTrendStrength();
+        case TRIGGER_PERFORMANCE:
+            return EvaluateByPerformance();
+        case TRIGGER_COMBINED:
+            return EvaluateByCombined();
+        default:
+            return currentActiveMode;
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Evaluate mode by volatility                                      |
+//+------------------------------------------------------------------+
+ENUM_TRADING_MODE EvaluateByVolatility() {
+    if (volatility.currentATR > VolatilityThresholdHigh) {
+        return Conservative; // Use conservative in high volatility
+    } else if (volatility.currentATR < VolatilityThresholdLow) {
+        return Moderate; // Use moderate in low volatility
+    }
+    return currentActiveMode;
+}
+
+//+------------------------------------------------------------------+
+//| Evaluate mode by trend strength                                  |
+//+------------------------------------------------------------------+
+ENUM_TRADING_MODE EvaluateByTrendStrength() {
+    if (currentTrend.strength > TrendStrengthSwitchThreshold) {
+        return Moderate; // Use moderate in strong trends
+    } else {
+        return Conservative; // Use conservative in weak trends
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Evaluate mode by performance                                     |
+//+------------------------------------------------------------------+
+ENUM_TRADING_MODE EvaluateByPerformance() {
+    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double performancePercent = ((currentBalance - modeStartBalance) / modeStartBalance) * 100;
+    
+    if (performancePercent < PerformanceThreshold) {
+        // Switch to opposite mode if current mode is underperforming
+        return (currentActiveMode == Conservative) ? Moderate : Conservative;
+    }
+    return currentActiveMode;
+}
+
+//+------------------------------------------------------------------+
+//| Evaluate mode by combined factors                                |
+//+------------------------------------------------------------------+
+ENUM_TRADING_MODE EvaluateByCombined() {
+    int conservativeScore = 0;
+    int moderateScore = 0;
+    
+    // Volatility factor
+    if (volatility.currentATR > VolatilityThresholdHigh) conservativeScore += 2;
+    else if (volatility.currentATR < VolatilityThresholdLow) moderateScore += 2;
+    
+    // Trend strength factor
+    if (currentTrend.strength > TrendStrengthSwitchThreshold) moderateScore += 2;
+    else conservativeScore += 1;
+    
+    // Performance factor
+    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double performancePercent = ((currentBalance - modeStartBalance) / modeStartBalance) * 100;
+    if (performancePercent < PerformanceThreshold) {
+        if (currentActiveMode == Conservative) moderateScore += 1;
+        else conservativeScore += 1;
+    }
+    
+    return (moderateScore > conservativeScore) ? Moderate : Conservative;
+}
+
+//+------------------------------------------------------------------+
+//| Execute mode switch                                              |
+//+------------------------------------------------------------------+
+void ExecuteModeSwitch(ENUM_TRADING_MODE newMode) {
+    if (newMode == currentActiveMode) return;
+    
+    lastActiveMode = currentActiveMode;
+    currentActiveMode = newMode;
+    lastModeSwitch = TimeCurrent();
+    modeStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    
+    string modeText = GetModeText(newMode);
+    Print("=== MODE SWITCH EXECUTED ===");
+    Print("🔄 Switched to Mode: ", modeText);
+    Print("New Mode: ", modeText);
+    Print("Switch Trigger: ", EnumToString(ModeSwitchTrigger));
+    Print("Current ATR: ", DoubleToString(volatility.currentATR, 1));
+    Print("Trend Strength: ", DoubleToString(currentTrend.strength * 100, 1), "%");
+    Print("============================");
+}
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick() {
+    // Reset daily flags (e.g., SL/TP hit counters)
+    ResetDailyFlags();
+    
+    // Ensure we're in the trading session
+    if (!InSession()) return;
+
+    // Update all market analysis
+    if (!AnalyzeTrendRealTime()) return;
+    if (!AnalyzeRSI()) return;
+    if (!AnalyzeMarketStructure()) return;
+
+    // Auto-switch between Conservative and Moderate modes
+    if (ShouldSwitchMode()) {
+        ENUM_TRADING_MODE suggestedMode = EvaluateOptimalMode();
+        ExecuteModeSwitch(suggestedMode);
+    }
+
+    // Monitor and manage closed positions (SL/TP counters)
+    MonitorClosedPositions();
+
+    // Manage open trades (e.g., trailing SL, breakeven, exit logic)
+    ManagePositions();
+
+    // Print trading status periodically (every 30 minutes)
+    PrintTradingStatus();
+
+    // Check if new positions can be opened
+    if (CanOpenNewPosition()) {
+        // BUY SIGNAL
+        if (EntryCondition(true)) {
+            Print("BUY SIGNAL DETECTED!");
+            Print("Trend: ", (currentTrend.direction == 1) ? "BULLISH" : "NEUTRAL", 
+                  " Strength: ", DoubleToString(currentTrend.strength * 100, 1), "%");
+            Print("Structure: ", structure.isUptrend ? "UPTREND" : "NEUTRAL");
+            Print("RSI: ", DoubleToString(rsiData.currentRSI, 1));
+            Print("EMA Slope: ", DoubleToString(currentTrend.emaSlope, 1));
+            OpenBuy();
+        }
+
+        // SELL SIGNAL
+        else if (EntryCondition(false)) {
+            // Optional: Restrict sell logic in Conservative mode
+            if (currentActiveMode == Conservative) {
+                if (UseRSIDivergence) {
+                    // Optional divergence check passed
+                    Print("SELL SIGNAL DETECTED (with RSI Divergence Check)");
+                } else {
+                    Print("SELL SIGNAL DETECTED!");
+                }
+            } else {
+                Print("SELL SIGNAL DETECTED!");
+            }
+
+            Print("Trend: ", (currentTrend.direction == -1) ? "BEARISH" : "NEUTRAL", 
+                  " Strength: ", DoubleToString(currentTrend.strength * 100, 1), "%");
+            Print("Structure: ", structure.isDowntrend ? "DOWNTREND" : "NEUTRAL");
+            Print("RSI: ", DoubleToString(rsiData.currentRSI, 1));
+            Print("EMA Slope: ", DoubleToString(currentTrend.emaSlope, 1));
+            OpenSell();
+        }
+    }
+}
+//+------------------------------------------------------------------+
+//| Expert trade function                                            |
+//+------------------------------------------------------------------+
+void OnTrade() {
+    // This function is called when trade operations are executed
+    // We can add additional logic here if needed for trade monitoring
+}
+
+//+------------------------------------------------------------------+
+//| Expert timer function                                            |
+//+------------------------------------------------------------------+
+void OnTimer() {
+    // This function can be used for periodic tasks
+    // Currently not implemented but available for future enhancements
+}
+
+//+------------------------------------------------------------------+
+//| ChartEvent function                                              |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam) {
+    // This function can be used to handle chart events
+    // Currently not implemented but available for future enhancements
+}
+
+//+------------------------------------------------------------------+
+//| Tester function                                                  |
+//+------------------------------------------------------------------+
+double OnTester() {
+    // Custom optimization metric for strategy tester
+    // This can be enhanced to return custom fitness values
+    return 0.0;
+}
+
+//+------------------------------------------------------------------+
+//| Book Event function                                              |
+//+------------------------------------------------------------------+
+void OnBookEvent(const string &symbol) {
+    // This function is called when the market depth changes
+    // Currently not implemented but available for future enhancements
+}
+
+//+------------------------------------------------------------------+
+//| Trade Transaction function                                       |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                       const MqlTradeRequest &request,
+                       const MqlTradeResult &result) {
+    // Enhanced trade transaction monitoring
+    if (trans.symbol == _Symbol) {
+        switch (trans.type) {
+            case TRADE_TRANSACTION_DEAL_ADD:
+                if (HistoryDealSelect(trans.deal)) {
+                    double deal_profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+                    double deal_commission = HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
+                    double deal_swap = HistoryDealGetDouble(trans.deal, DEAL_SWAP);
+                    Print("Deal executed: ", trans.deal, " Volume: ", trans.volume, 
+                          " Price: ", trans.price, " Profit: ", deal_profit, 
+                          " Commission: ", deal_commission, " Swap: ", deal_swap);
+                } else {
+                    Print("Deal executed: ", trans.deal, " Volume: ", trans.volume, 
+                          " Price: ", trans.price);
+                }
+                break;
+                
+            case TRADE_TRANSACTION_ORDER_ADD:
+                Print("Order added: ", trans.order, " Type: ", trans.order_type);
+                break;
+                
+            case TRADE_TRANSACTION_ORDER_DELETE:
+                Print("Order deleted: ", trans.order);
+                break;
+                
+            case TRADE_TRANSACTION_POSITION:
+                Print("Position modified: ", trans.position, " Volume: ", trans.volume);
+                break;
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| End of Enhanced Expert Advisor v5.1                             |
+//+------------------------------------------------------------------+
